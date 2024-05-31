@@ -4801,6 +4801,38 @@ static const struct macb_config at91sam9260_config = {
 	.usrio = &macb_default_usrio,
 };
 
+static int gridpoint_ec2k_init(struct platform_device *pdev)
+{
+	struct gpio_desc *desc;
+	int err;
+
+	desc = gpio_to_desc(24);
+	if (desc) {
+		err = gpiod_direction_output_raw(desc, 1);
+		if (!err) {
+			dev_info(&pdev->dev, "Reset of ksz8081 via PA24\n");
+			gpiod_set_value(desc, 0);
+			usleep_range(500, 1000);
+			gpiod_set_value(desc, 1);
+			usleep_range(100, 1000);
+		} else {
+			dev_err(&pdev->dev, "Could not set gpio 24 as output\n");
+		}
+	} else {
+		dev_err(&pdev->dev, "Could not get gpio 24\n");
+	}
+
+	return macb_init(pdev);
+}
+
+static const struct macb_config gridpoint_ec2k_config = {
+	.caps = MACB_CAPS_USRIO_DEFAULT_IS_MII_GMII,
+	.dma_burst_length = 16,
+	.clk_init = macb_clk_init,
+	.init = gridpoint_ec2k_init,
+	.usrio = &macb_default_usrio,
+};
+
 static const struct macb_config sama5d3macb_config = {
 	.caps = MACB_CAPS_SG_DISABLED |
 		MACB_CAPS_USRIO_HAS_CLKEN | MACB_CAPS_USRIO_DEFAULT_IS_MII_GMII,
@@ -4933,6 +4965,7 @@ static const struct of_device_id macb_dt_ids[] = {
 	{ .compatible = "cdns,pc302-gem", .data = &pc302gem_config },
 	{ .compatible = "cdns,gem", .data = &pc302gem_config },
 	{ .compatible = "cdns,sam9x60-macb", .data = &at91sam9260_config },
+	{ .compatible = "gridpoint,ec2k", .data = &gridpoint_ec2k_config },
 	{ .compatible = "atmel,sama5d2-gem", .data = &sama5d2_config },
 	{ .compatible = "atmel,sama5d29-gem", .data = &sama5d29_config },
 	{ .compatible = "atmel,sama5d3-gem", .data = &sama5d3_config },
