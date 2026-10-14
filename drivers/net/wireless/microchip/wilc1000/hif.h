@@ -31,8 +31,6 @@ enum {
 	WILC_GET_CFG
 };
 
-extern uint32_t cfg_packet_timeout;
-
 struct rf_info {
 	u8 link_speed;
 	s8 rssi;

@@ -871,7 +871,7 @@ static void chip_wakeup_wilc3000(struct wilc *wilc, int source)
 		}
 	} while (((clk_status_reg_val & clk_status_bit) == 0)
 		 && (wake_seq_trials-- > 0));
-	if (!wake_seq_trials)
+	if ((clk_status_reg_val & clk_status_bit) == 0)
 		dev_err(wilc->dev, "clocks still OFF. Wake up failed\n");
 	wilc->keep_awake[source] = true;
 }
@@ -1234,9 +1234,6 @@ int wilc_wlan_handle_txq(struct wilc *wilc, u32 *txq_count)
 	}
 
 	ret = func->hif_block_tx_ext(wilc, 0, txb, offset);
-
-	if (!ret)
-		cfg_packet_timeout = 0;
 
 out_release_bus:
 	release_bus(wilc, WILC_BUS_RELEASE_ALLOW_SLEEP, DEV_WIFI);
@@ -1871,7 +1868,6 @@ int wilc_wlan_cfg_get(struct wilc_vif *vif, int start, u16 wid, int commit,
 	return ret_size;
 }
 
-unsigned int cfg_packet_timeout;
 int wilc_send_config_pkt(struct wilc_vif *vif, u8 mode, struct wid *wids,
 			 u32 count)
 {
@@ -1883,16 +1879,6 @@ int wilc_send_config_pkt(struct wilc_vif *vif, u8 mode, struct wid *wids,
 	if (is_test_mode && test_in_progress)
 		return 0;
 #endif
-
-
-	if (wait_for_recovery) {
-		PRINT_INFO(vif->ndev, CORECONFIG_DBG,
-			   "Host interface is suspended\n");
-		while (wait_for_recovery)
-			msleep(300);
-		PRINT_INFO(vif->ndev, CORECONFIG_DBG,
-			   "Host interface is resumed\n");
-	}
 
 	if (mode == WILC_GET_CFG) {
 		for (i = 0; i < count; i++) {
@@ -1926,7 +1912,6 @@ int wilc_send_config_pkt(struct wilc_vif *vif, u8 mode, struct wid *wids,
 			}
 		}
 	}
-	cfg_packet_timeout = (ret < 0) ? cfg_packet_timeout + 1 : 0;
 	return ret;
 }
 

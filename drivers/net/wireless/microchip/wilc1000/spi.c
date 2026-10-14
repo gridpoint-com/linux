@@ -245,6 +245,7 @@ static int wilc_spi_suspend(struct device *dev)
 	struct wilc *wilc = spi_get_drvdata(spi);
 
 	dev_info(&spi->dev, "\n\n << SUSPEND >>\n\n");
+	wilc_recovery_suspend(wilc);
 	mutex_lock(&wilc->hif_cs);
 	chip_wakeup(wilc, DEV_WIFI);
 
@@ -280,6 +281,8 @@ static int wilc_spi_resume(struct device *dev)
 
 	if (mutex_is_locked(&wilc->hif_cs))
 		mutex_unlock(&wilc->hif_cs);
+
+	wilc_recovery_resume(wilc);
 
 	return 0;
 }

@@ -735,6 +735,14 @@ static int add_key(struct wiphy *wiphy, struct net_device *netdev, int link_id,
 					   rx_mic, tx_mic, op_mode, mode,
 					   key_index);
 
+		if (!ret && !pairwise && op_mode == WILC_AP_MODE &&
+		    params->key_len <= sizeof(vif->gtk)) {
+			vif->gtk_index = key_index;
+			vif->gtk_cipher = params->cipher;
+			memcpy(vif->gtk, params->key, params->key_len);
+			vif->gtk_len = params->key_len;
+		}
+
 		break;
 	case WLAN_CIPHER_SUITE_AES_CMAC:
 		ret = wilc_wfi_cfg_allocate_wpa_igtk_entry(priv, key_index);
@@ -869,6 +877,7 @@ static int get_station(struct wiphy *wiphy, struct net_device *dev,
 	u32 i = 0;
 	u32 associatedsta = ~0;
 	u32 inactive_time = 0;
+	int ret;
 
 	if (vif->iftype == WILC_AP_MODE || vif->iftype == WILC_GO_MODE) {
 		PRINT_INFO(vif->ndev, HOSTAPD_DBG,
@@ -887,9 +896,11 @@ static int get_station(struct wiphy *wiphy, struct net_device *dev,
 			return -ENOENT;
 		}
 
-		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_INACTIVE_TIME);
+		ret = wilc_get_inactive_time(vif, mac, &inactive_time);
+		if (ret)
+			return ret;
 
-		wilc_get_inactive_time(vif, mac, &inactive_time);
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_INACTIVE_TIME);
 		sinfo->inactive_time = 1000 * inactive_time;
 		PRINT_INFO(vif->ndev, CFG80211_DBG, "Inactive time %d\n",
 			   sinfo->inactive_time);
@@ -1683,6 +1694,35 @@ static int change_virtual_intf(struct wiphy *wiphy, struct net_device *dev,
 	return 0;
 }
 
+static void wilc_memdup_ie(u8 **pdst, size_t *pdst_len, const u8 *src,
+			   size_t src_len)
+{
+	kfree(*pdst);
+	*pdst = NULL;
+	*pdst_len = 0;
+	if (src_len > 0) {
+		*pdst = kmemdup(src, src_len, GFP_KERNEL);
+		if (*pdst)
+			*pdst_len = src_len;
+	}
+}
+
+static int _wilc_start_ap(struct wiphy *wiphy, struct net_device *dev,
+			  struct cfg80211_chan_def *chandef, u32 interval,
+			  u32 dtim_period, struct cfg80211_beacon_data *beacon)
+{
+	struct wilc_vif *vif = netdev_priv(dev);
+	int ret;
+
+	ret = set_channel(wiphy, chandef);
+	if (ret != 0)
+		netdev_err(dev, "Error in setting channel\n");
+
+	wilc_wlan_set_bssid(dev, dev->dev_addr, WILC_AP_MODE);
+
+	return wilc_add_beacon(vif, interval, dtim_period, beacon);
+}
+
 static int start_ap(struct wiphy *wiphy, struct net_device *dev,
 		    struct cfg80211_ap_settings *settings)
 {
@@ -1690,24 +1730,43 @@ static int start_ap(struct wiphy *wiphy, struct net_device *dev,
 	int ret;
 
 	PRINT_INFO(vif->ndev, HOSTAPD_DBG, "Starting ap\n");
-	ret = set_channel(wiphy, &settings->chandef);
-	if (ret != 0)
-		netdev_err(dev, "Error in setting channel\n");
+	ret = _wilc_start_ap(wiphy, dev, &settings->chandef,
+			     settings->beacon_interval, settings->dtim_period,
+			     &settings->beacon);
+	if (ret)
+		return ret;
 
-	wilc_wlan_set_bssid(dev, dev->dev_addr, WILC_AP_MODE);
+	vif->dtim_period = settings->dtim_period;
+	wilc_memdup_ie(&vif->beacon_head, &vif->beacon_head_len,
+		       settings->beacon.head, settings->beacon.head_len);
+	wilc_memdup_ie(&vif->beacon_tail, &vif->beacon_tail_len,
+		       settings->beacon.tail, settings->beacon.tail_len);
 
-	return wilc_add_beacon(vif, settings->beacon_interval,
-				   settings->dtim_period, &settings->beacon);
+	return 0;
 }
 
 static int change_beacon(struct wiphy *wiphy, struct net_device *dev,
 			 struct cfg80211_ap_update *params)
 {
 	struct wilc_vif *vif = netdev_priv(dev);
+	struct cfg80211_beacon_data *beacon = &params->beacon;
+	int ret;
 
 	PRINT_INFO(vif->ndev, HOSTAPD_DBG, "Setting beacon\n");
 
-	return wilc_add_beacon(vif, 0, 0, &params->beacon);
+	ret = wilc_add_beacon(vif, 0, 0, beacon);
+	if (ret)
+		return ret;
+
+	/* head and tail are NULL if not changed */
+	if (beacon->head)
+		wilc_memdup_ie(&vif->beacon_head, &vif->beacon_head_len,
+			       beacon->head, beacon->head_len);
+	if (beacon->tail)
+		wilc_memdup_ie(&vif->beacon_tail, &vif->beacon_tail_len,
+			       beacon->tail, beacon->tail_len);
+
+	return 0;
 }
 
 static int stop_ap(struct wiphy *wiphy, struct net_device *dev,
@@ -1725,7 +1784,74 @@ static int stop_ap(struct wiphy *wiphy, struct net_device *dev,
 	if (ret)
 		netdev_err(dev, "Host delete beacon fail\n");
 
-	return ret;
+	wilc_memdup_ie(&vif->beacon_head, &vif->beacon_head_len, NULL, 0);
+	wilc_memdup_ie(&vif->beacon_tail, &vif->beacon_tail_len, NULL, 0);
+	memset(vif->gtk, 0, sizeof(vif->gtk));
+	vif->gtk_len = 0;
+
+	/* On error cfg80211 keeps the AP marked as started and refuses the
+	 * next START_AP with -EALREADY. A firmware that can't delete the
+	 * beacon is dead or about to be reloaded, so report success.
+	 */
+	return 0;
+}
+
+int wilc_cfg80211_ap_recovery(struct wilc *wl)
+{
+	struct wilc_vif *vif;
+	int srcu_idx;
+	int err = 0;
+
+	srcu_idx = srcu_read_lock(&wl->srcu);
+	wilc_for_each_vif(wl, vif) {
+		struct wireless_dev *wdev = vif->ndev->ieee80211_ptr;
+		struct cfg80211_beacon_data beacon = {};
+		struct key_params key_params = {};
+		u8 gtk[WLAN_MAX_KEY_LEN];
+		int ret;
+
+		if (!vif->mac_opened || vif->beacon_head_len == 0)
+			continue;
+
+		beacon.head = vif->beacon_head;
+		beacon.head_len = vif->beacon_head_len;
+		beacon.tail = vif->beacon_tail;
+		beacon.tail_len = vif->beacon_tail_len;
+
+		netdev_info(vif->ndev,
+			    "AP recovery: channel %d, interval %u, dtim %u\n",
+			    wdev->links[0].ap.chandef.chan->hw_value,
+			    wdev->links[0].ap.beacon_interval, vif->dtim_period);
+		ret = _wilc_start_ap(wl->wiphy, vif->ndev,
+				     &wdev->links[0].ap.chandef,
+				     wdev->links[0].ap.beacon_interval,
+				     vif->dtim_period, &beacon);
+		if (ret) {
+			netdev_err(vif->ndev, "AP recovery failed (%d)\n", ret);
+			err = ret;
+			continue;
+		}
+
+		if (vif->gtk_len == 0)
+			continue;
+
+		/* add_key() copies params->key into vif->gtk */
+		memcpy(gtk, vif->gtk, vif->gtk_len);
+		key_params.key = gtk;
+		key_params.key_len = vif->gtk_len;
+		key_params.cipher = vif->gtk_cipher;
+		ret = add_key(wl->wiphy, vif->ndev, -1, vif->gtk_index, false,
+			      NULL, &key_params);
+
+		if (ret) {
+			netdev_err(vif->ndev,
+				   "AP recovery add key failed (%d)\n", ret);
+			err = ret;
+		}
+	}
+	srcu_read_unlock(&wl->srcu, srcu_idx);
+
+	return err;
 }
 
 static int add_station(struct wiphy *wiphy, struct net_device *dev,
@@ -2143,7 +2269,6 @@ static void wlan_init_locks(struct wilc *wl)
 	init_completion(&wl->cfg_event);
 	init_completion(&wl->sync_event);
 	init_completion(&wl->txq_thread_started);
-	init_completion(&wl->debug_thread_started);
 	init_srcu_struct(&wl->srcu);
 }
 
@@ -2223,6 +2348,7 @@ int wilc_cfg80211_init(struct wilc **wilc, struct device *dev, int io_type,
 		return -EINVAL;
 
 	wlan_init_locks(wl);
+	wilc_recovery_init(wl);
 
 	ret = wilc_wlan_cfg_init(wl);
 	if (ret)

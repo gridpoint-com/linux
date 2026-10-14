@@ -58,115 +58,237 @@ MODULE_PARM_DESC(is_test_mode,
 		 "use to enable loopback test mode, is_loopback_mode = 1 means loopback is enable, default disabled");
 #endif /* WILCS02_TEST_BUS_INTERFACE */
 
-static int debug_running;
+#define WILC_HB_RESP_MISS_THRES		1
+#define WILC_FW_RECOVERY_RETRIES	5
+#define WILC_FW_RECOVERY_TO		msecs_to_jiffies(5000)
+#define WILC_FW_RECOVERY_RETRY_DELAY	msecs_to_jiffies(1000)
+
+static unsigned int heart_beat_poll = 5000;
+module_param(heart_beat_poll, uint, 0644);
+MODULE_PARM_DESC(heart_beat_poll,
+		 "Fw error detection periodic polling in msecs, 0 to disable");
+
 static int recovery_on;
-int wait_for_recovery;
-static int debug_thread(void *arg)
+
+static void wilc_recovery_hb_arm(struct wilc *wl)
 {
-	struct wilc *wl = arg;
+	wl->fw_recovery.hb_misscnt = 0;
+
+	if (heart_beat_poll && !wl->fw_recovery.cleanup)
+		schedule_delayed_work(&wl->fw_recovery.hb_work,
+				      msecs_to_jiffies(heart_beat_poll));
+}
+
+static void wilc_recovery_err_notify(struct wilc *wl)
+{
+	if (wl->fw_recovery.cleanup || recovery_on)
+		return;
+
+	dev_err(wl->dev, "Fw error detected, starting recovery\n");
+	schedule_delayed_work(&wl->fw_recovery.recovery_work, 0);
+}
+
+static int wilc_recovery_hb_challenge(struct wilc *wl)
+{
+	u8 firmware_ver[WILC_MAX_FW_VERSION_STR_SIZE];
 	struct wilc_vif *vif;
-	signed long timeout;
-	struct host_if_drv *hif_drv;
-	int i = 0;
+	struct wid wid;
+	int srcu_idx;
+	int ret = 0;
 
-	complete(&wl->debug_thread_started);
+	wid.id = WID_FIRMWARE_VERSION;
+	wid.type = WID_STR;
+	wid.val = (s8 *)firmware_ver;
+	wid.size = sizeof(firmware_ver);
 
-	while (1) {
-		int srcu_idx;
-		int ret;
-
-		if (!wl->initialized && !kthread_should_stop()) {
-			msleep(1000);
-			continue;
-		} else if (!wl->initialized) {
+	srcu_idx = srcu_read_lock(&wl->srcu);
+	wilc_for_each_vif(wl, vif) {
+		if (vif->mac_opened) {
+			ret = wilc_send_config_pkt(vif, WILC_GET_CFG, &wid, 1);
 			break;
 		}
-		ret = wait_for_completion_interruptible_timeout(
-			&wl->debug_thread_started, msecs_to_jiffies(6000));
-		if (ret > 0) {
-			while (!kthread_should_stop())
-				schedule();
-			return 0;
-		}
-		if (!debug_running || ret == -ERESTARTSYS)
-			continue;
-
-		if (cfg_packet_timeout < 5)
-			continue;
-
-		pr_info("%s <Recover>\n", __func__);
-		cfg_packet_timeout = 0;
-		timeout = 10;
-
-		if (wl->close == 1)
-			continue;
-
-		recovery_on = 1;
-		wait_for_recovery = 1;
-
-		srcu_idx = srcu_read_lock(&wl->srcu);
-		list_for_each_entry_rcu(vif, &wl->vif_list, list) {
-			/* close the interface only if it was open */
-			if (vif->mac_opened) {
-				wilc_mac_close(vif->ndev);
-				vif->restart = 1;
-			}
-		}
-
-		/* For Spi, clear 'is_init' flag so that protocol offset
-		 * register can be send to FW to setup required crc mode after
-		 * chip reset
-		 */
-		if (wl->io_type == WILC_HIF_SPI)
-			wl->hif_func->hif_clear_init(wl);
-
-		//TODO://Need to find way to call them in reverse
-		i = 0;
-		list_for_each_entry_rcu(vif, &wl->vif_list, list) {
-			struct wilc_conn_info *info;
-
-			/* Only open the interface manually closed earlier */
-			if (!vif->restart)
-				continue;
-			i++;
-			hif_drv = vif->priv.hif_drv;
-			while (wilc_mac_open(vif->ndev) && --timeout)
-				msleep(100);
-
-			if (timeout == 0)
-				PRINT_WRN(vif->ndev, GENERIC_DBG,
-					  "Couldn't restart ifc %d\n", i);
-
-			if (hif_drv->hif_state == HOST_IF_CONNECTED) {
-				info = &hif_drv->conn_info;
-				PRINT_INFO(vif->ndev, GENERIC_DBG,
-					   "notify the user with the Disconnection\n");
-				if (hif_drv->usr_scan_req.scan_result) {
-					PRINT_INFO(vif->ndev, GENERIC_DBG,
-						   "Abort the running OBSS Scan\n");
-					del_timer(&hif_drv->scan_timer);
-					handle_scan_done(vif,
-							 SCAN_EVENT_ABORTED);
-				}
-				if (info->conn_result) {
-					info->conn_result(CONN_DISCONN_EVENT_DISCONN_NOTIF,
-							  0, info->priv);
-				} else {
-					PRINT_ER(vif->ndev,
-						 "Connect result NULL\n");
-				}
-				eth_zero_addr(hif_drv->assoc_bssid);
-				info->req_ies_len = 0;
-				kfree(info->req_ies);
-				info->req_ies = NULL;
-				hif_drv->hif_state = HOST_IF_IDLE;
-			}
-			vif->restart = 0;
-		}
-		srcu_read_unlock(&wl->srcu, srcu_idx);
-		recovery_on = 0;
 	}
-	return 0;
+	srcu_read_unlock(&wl->srcu, srcu_idx);
+
+	return ret;
+}
+
+static void wilc_recovery_hb_work(struct work_struct *work)
+{
+	struct wilc *wl = container_of(to_delayed_work(work), struct wilc,
+				       fw_recovery.hb_work);
+
+	if (wl->fw_recovery.cleanup || !wl->initialized)
+		return;
+
+	if (!recovery_on && !wl->close) {
+		if (wilc_recovery_hb_challenge(wl))
+			wl->fw_recovery.hb_misscnt++;
+		else
+			wl->fw_recovery.hb_misscnt = 0;
+
+		if (wl->fw_recovery.hb_misscnt > WILC_HB_RESP_MISS_THRES) {
+			wl->fw_recovery.hb_misscnt = 0;
+			wilc_recovery_err_notify(wl);
+			return;
+		}
+	}
+
+	if (heart_beat_poll)
+		schedule_delayed_work(&wl->fw_recovery.hb_work,
+				      msecs_to_jiffies(heart_beat_poll));
+}
+
+static void wilc_recovery_work(struct work_struct *work)
+{
+	struct wilc *wl = container_of(to_delayed_work(work), struct wilc,
+				       fw_recovery.recovery_work);
+	struct wilc_fw_recovery *recovery = &wl->fw_recovery;
+	struct wilc_vif *vif;
+	bool give_up = false;
+	bool pending = false;
+	int srcu_idx;
+	int ret;
+
+	rtnl_lock();
+	wiphy_lock(wl->wiphy);
+	srcu_idx = srcu_read_lock(&wl->srcu);
+
+	list_for_each_entry_srcu(vif, &wl->vif_list, list,
+				 srcu_read_lock_held(&wl->srcu)) {
+		if (vif->mac_opened || vif->restart)
+			pending = true;
+	}
+	if (!pending) {
+		dev_info(wl->dev, "No recovery - interface is down\n");
+		goto out;
+	}
+
+	/* increment @recovery_count if less then WILC_FW_RECOVERY_TO
+	 * passed since last recovery attempt
+	 */
+	if (time_is_after_jiffies(recovery->last_recovery +
+				  WILC_FW_RECOVERY_TO))
+		recovery->recovery_count++;
+	else
+		recovery->recovery_count = 1; /* fw was alive for a long time */
+
+	if (recovery->recovery_count > WILC_FW_RECOVERY_RETRIES) {
+		dev_err(wl->dev, "too many recovery attempts (%d), giving up\n",
+			recovery->recovery_count);
+		give_up = true;
+		goto out;
+	}
+
+	dev_info(wl->dev, "fw error recovery requested (try %d)...\n",
+		 recovery->recovery_count);
+
+	recovery_on = 1;
+
+	list_for_each_entry_srcu(vif, &wl->vif_list, list,
+				 srcu_read_lock_held(&wl->srcu)) {
+		/* close the interface only if it was open */
+		if (!vif->mac_opened)
+			continue;
+
+		wilc_mac_close(vif->ndev);
+		vif->restart = 1;
+		/* get_station() returns -ENOENT so the AP drops its stations */
+		memset(&vif->priv.assoc_stainfo, 0,
+		       sizeof(vif->priv.assoc_stainfo));
+	}
+
+	/* For Spi, clear 'is_init' flag so that protocol offset
+	 * register can be send to FW to setup required crc mode after
+	 * chip reset
+	 */
+	if (wl->io_type == WILC_HIF_SPI)
+		wl->hif_func->hif_clear_init(wl);
+
+	pending = false;
+	list_for_each_entry_srcu(vif, &wl->vif_list, list,
+				 srcu_read_lock_held(&wl->srcu)) {
+		/* Only open the interface manually closed earlier */
+		if (!vif->restart)
+			continue;
+
+		ret = wilc_mac_open(vif->ndev);
+		if (ret) {
+			netdev_err(vif->ndev, "Couldn't restart ifc (%d)\n",
+				   ret);
+			pending = true;
+			continue;
+		}
+		vif->restart = 0;
+	}
+
+	/* taken after the attempt so that a slow reopen still counts the
+	 * retry below against WILC_FW_RECOVERY_RETRIES
+	 */
+	recovery->last_recovery = jiffies;
+	recovery_on = 0;
+
+	if (wilc_cfg80211_ap_recovery(wl))
+		pending = true;
+
+	if (pending)
+		schedule_delayed_work(&recovery->recovery_work,
+				      WILC_FW_RECOVERY_RETRY_DELAY);
+	else
+		dev_info(wl->dev, "... completed\n");
+
+out:
+	srcu_read_unlock(&wl->srcu, srcu_idx);
+	wiphy_unlock(wl->wiphy);
+
+	/* Take the interfaces down so userspace sees the firmware is gone.
+	 * dev_close() takes the wiphy lock, so only RTNL may be held here.
+	 */
+	if (give_up)
+		cfg80211_shutdown_all_interfaces(wl->wiphy);
+
+	rtnl_unlock();
+}
+
+void wilc_recovery_init(struct wilc *wl)
+{
+	INIT_DELAYED_WORK(&wl->fw_recovery.recovery_work, wilc_recovery_work);
+	INIT_DELAYED_WORK(&wl->fw_recovery.hb_work, wilc_recovery_hb_work);
+}
+
+static void wilc_recovery_cleanup(struct wilc *wl)
+{
+	wl->fw_recovery.cleanup = true;
+
+	cancel_delayed_work_sync(&wl->fw_recovery.hb_work);
+	cancel_delayed_work_sync(&wl->fw_recovery.recovery_work);
+}
+
+void wilc_recovery_suspend(struct wilc *wl)
+{
+	wilc_recovery_cleanup(wl);
+}
+
+void wilc_recovery_resume(struct wilc *wl)
+{
+	struct wilc_vif *vif;
+	bool pending = false;
+	int srcu_idx;
+
+	wl->fw_recovery.cleanup = false;
+
+	/* resume a recovery that suspend interrupted between retries */
+	srcu_idx = srcu_read_lock(&wl->srcu);
+	wilc_for_each_vif(wl, vif) {
+		if (vif->restart)
+			pending = true;
+	}
+	srcu_read_unlock(&wl->srcu, srcu_idx);
+
+	if (wl->initialized)
+		wilc_recovery_hb_arm(wl);
+	if (pending)
+		schedule_delayed_work(&wl->fw_recovery.recovery_work, 0);
 }
 
 static void wilc_disable_irq(struct wilc *wilc, int wait)
@@ -668,15 +790,6 @@ static void wlan_deinitialize_threads(struct net_device *dev)
 	struct wilc *wl = vif->wilc;
 
 	PRINT_INFO(vif->ndev, INIT_DBG, "Deinitializing Threads\n");
-	if (!recovery_on) {
-		PRINT_INFO(vif->ndev, INIT_DBG, "Deinit debug Thread\n");
-		debug_running = false;
-		complete(&wl->debug_thread_started);
-		if (wl->debug_thread) {
-			kthread_stop(wl->debug_thread);
-			wl->debug_thread = NULL;
-		}
-	}
 
 	wl->close = 1;
 	PRINT_INFO(vif->ndev, INIT_DBG, "Deinitializing Threads\n");
@@ -702,6 +815,8 @@ static void wilc_wlan_deinitialize(struct net_device *dev)
 
 	if (wl->initialized) {
 		PRINT_INFO(vif->ndev, INIT_DBG, "Deinitializing wilc  ...\n");
+
+		cancel_delayed_work_sync(&wl->fw_recovery.hb_work);
 
 		PRINT_D(vif->ndev, INIT_DBG, "destroy aging timer\n");
 
@@ -753,21 +868,6 @@ static int wlan_initialize_threads(struct net_device *dev)
 		return PTR_ERR(wilc->txq_thread);
 	}
 	wait_for_completion(&wilc->txq_thread_started);
-
-	if (!debug_running) {
-		PRINT_INFO(vif->ndev, INIT_DBG,
-			   "Creating kthread for Debugging\n");
-		wilc->debug_thread = kthread_run(debug_thread, (void *)wilc,
-						 "WILC_DEBUG");
-		if (IS_ERR(wilc->debug_thread)) {
-			PRINT_ER(dev, "couldn't create debug thread\n");
-			wilc->close = 1;
-			kthread_stop(wilc->txq_thread);
-			return PTR_ERR(wilc->debug_thread);
-		}
-		debug_running = true;
-		wait_for_completion(&wilc->debug_thread_started);
-	}
 
 	return 0;
 }
@@ -944,6 +1044,7 @@ static int wilc_wlan_initialize(struct net_device *dev, struct wilc_vif *vif)
 			}
 		}
 		wl->initialized = true;
+		wilc_recovery_hb_arm(wl);
 		return 0;
 
 fail_fw_start:
@@ -1013,7 +1114,6 @@ static int wilc_mac_open(struct net_device *ndev)
 	if (!is_test_mode)
 #endif
 	{
-		wait_for_recovery = 0;
 		wilc_set_operation_mode(vif, wilc_get_vif_idx(vif), vif->iftype,
 					vif->idx);
 
@@ -1027,7 +1127,8 @@ static int wilc_mac_open(struct net_device *ndev)
 		netdev_dbg(ndev, "Mac address: %pM\n", ndev->dev_addr);
 		if (!is_valid_ether_addr(ndev->dev_addr)) {
 			PRINT_ER(ndev, "Mac address is not configured");
-			wilc_deinit_host_int(ndev);
+			if (!recovery_on)
+				wilc_deinit_host_int(ndev);
 			wilc_wlan_deinitialize(ndev);
 			return -EINVAL;
 		}
@@ -1222,6 +1323,16 @@ static int wilc_mac_close(struct net_device *ndev)
 
 	PRINT_INFO(vif->ndev, GENERIC_DBG, "Mac close\n");
 
+	/* Fw error recovery closed this interface but couldn't reopen it, so
+	 * it is already counted out of open_ifcs. Only the host interface,
+	 * which recovery keeps across the restart, is left to free.
+	 */
+	if (vif->restart && !recovery_on) {
+		wilc_deinit_host_int(ndev);
+		vif->restart = 0;
+		return 0;
+	}
+
 	if (wl->open_ifcs > 0) {
 		wl->open_ifcs--;
 	} else {
@@ -1362,6 +1473,8 @@ void wilc_netdev_cleanup(struct wilc *wilc)
 
 	if (!wilc)
 		return;
+
+	wilc_recovery_cleanup(wilc);
 
 	if (wilc->firmware) {
 		release_firmware(wilc->firmware);

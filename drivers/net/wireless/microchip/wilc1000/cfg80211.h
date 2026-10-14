@@ -14,6 +14,7 @@ int wilc_cfg80211_register(struct wilc *wilc);
 struct wilc *wilc_create_wiphy(struct device *dev);
 void wilc_deinit_host_int(struct net_device *net);
 int wilc_init_host_int(struct net_device *net);
+int wilc_cfg80211_ap_recovery(struct wilc *wl);
 void wilc_wfi_monitor_rx(struct net_device *mon_dev, u8 *buff, u32 size);
 void wilc_wfi_deinit_mon_interface(struct wilc *wl, bool rtnl_locked);
 struct net_device *wilc_wfi_init_mon_interface(struct wilc *wl,

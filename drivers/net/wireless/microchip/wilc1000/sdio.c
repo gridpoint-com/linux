@@ -362,6 +362,7 @@ static int wilc_sdio_suspend(struct device *dev)
 	int ret;
 
 	dev_info(&func->dev, "sdio suspend\n");
+	wilc_recovery_suspend(wilc);
 	mutex_lock(&wilc->hif_cs);
 
 	chip_wakeup(wilc, DEV_WIFI);
@@ -1444,6 +1445,8 @@ static int wilc_sdio_resume(struct device *dev)
 
 	if (mutex_is_locked(&wilc->hif_cs))
 		mutex_unlock(&wilc->hif_cs);
+
+	wilc_recovery_resume(wilc);
 
 	return 0;
 }

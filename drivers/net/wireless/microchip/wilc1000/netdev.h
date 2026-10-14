@@ -21,8 +21,6 @@
 #include "wlan_cfg.h"
 #include "wilcs02_loopback.h"
 
-extern int wait_for_recovery;
-
 #define FLOW_CONTROL_LOWER_THRESHOLD		128
 #define FLOW_CONTROL_UPPER_THRESHOLD		256
 
@@ -237,6 +235,15 @@ struct wilc_vif {
 	bool p2p_listen_state;
 	struct cfg80211_bss *bss;
 	struct cfg80211_external_auth_params auth;
+
+	/* AP settings saved for fw error recovery */
+	u32 dtim_period;
+	u8 *beacon_head, *beacon_tail;
+	size_t beacon_head_len, beacon_tail_len;
+	u8 gtk_index;
+	u32 gtk_cipher;
+	u8 gtk[WLAN_MAX_KEY_LEN];
+	size_t gtk_len;
 };
 
 struct wilc_power_gpios {
@@ -298,9 +305,16 @@ struct wilc {
 	struct completion sync_event;
 	struct completion txq_event;
 	struct completion txq_thread_started;
-	struct completion debug_thread_started;
 	struct task_struct *txq_thread;
-	struct task_struct *debug_thread;
+
+	struct wilc_fw_recovery {
+		struct delayed_work recovery_work;
+		struct delayed_work hb_work;
+		unsigned long last_recovery;
+		u32 recovery_count;
+		u8 hb_misscnt;
+		bool cleanup;
+	} fw_recovery;
 
 	int quit;
 
@@ -360,6 +374,9 @@ void wilc_frmw_to_host(struct wilc_vif *vif, u8 *buff, u32 size,
 		       u32 pkt_offset, u8 status);
 void wilc_mac_indicate(struct wilc *wilc);
 void wilc_netdev_cleanup(struct wilc *wilc);
+void wilc_recovery_init(struct wilc *wl);
+void wilc_recovery_suspend(struct wilc *wl);
+void wilc_recovery_resume(struct wilc *wl);
 void wilc_wfi_mgmt_rx(struct wilc *wilc, u8 *buff, u32 size, bool is_auth);
 void wilc_wlan_set_bssid(struct net_device *wilc_netdev, const u8 *bssid,
 			 u8 mode);
